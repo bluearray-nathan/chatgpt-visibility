@@ -4,7 +4,6 @@ from urllib.parse import urlparse
 import numpy as np
 import pandas as pd
 import streamlit as st
-
 from openai import OpenAI
 
 # -----------------------------
@@ -27,6 +26,14 @@ def get_openai_client():
 client = get_openai_client()
 
 # -----------------------------
+# Try to import hdbscan
+# -----------------------------
+try:
+    import hdbscan
+except ImportError:
+    hdbscan = None
+
+# -----------------------------
 # Streamlit UI setup
 # -----------------------------
 st.set_page_config(page_title="LLM Topic Visibility", layout="wide")
@@ -39,7 +46,7 @@ This tool:
 1. Takes up to **500 queries** and a **tracked domain**  
 2. Uses an OpenAI model with **web search** to answer each query  
 3. Detects if / where your domain is cited  
-4. (Optional) Clusters queries using HDBSCAN + embeddings  
+4. Optionally clusters queries using HDBSCAN + embeddings  
 5. Computes **per-topic visibility** and **which URLs of your domain appear**
 """
 )
@@ -68,14 +75,8 @@ clustering_mode = st.sidebar.radio(
     ],
 )
 
-# Try to import hdbscan
-try:
-    import hdbscan
-except ImportError:
-    hdbscan = None
-    if clustering_mode == "Always run clustering in this app (overwrite labels)":
-        st.sidebar.error("hdbscan not installed. Run `pip install hdbscan`.")
-
+if clustering_mode == "Always run clustering in this app (overwrite labels)" and hdbscan is None:
+    st.sidebar.error("hdbscan is not installed. Run `pip install hdbscan` to enable clustering.")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("**500 queries with web search may incur usage charges.**")
@@ -93,7 +94,11 @@ run_button = st.button("Run analysis")
 # -----------------------------
 def call_openai_with_web_search(query: str, model: str):
     """
-    Calls OpenAI Responses API with web_search enabled.
+    Calls the OpenAI Responses API with web_search enabled.
+
+    Returns:
+        answer_text: str
+        urls: list[str] - URL citations in order of appearance
     """
     try:
         resp = client.responses.create(
@@ -105,18 +110,18 @@ def call_openai_with_web_search(query: str, model: str):
         st.error(f"OpenAI error for query: {query[:80]}...\n{e}")
         return "", []
 
-    # Find the message object
+    # Find the assistant message object
     message_item = next(
         (o for o in resp.output if getattr(o, "type", "") == "message"),
         None,
     )
-    if not message_item or not message_item.content:
+    if not message_item or not getattr(message_item, "content", None):
         return "", []
 
     content0 = message_item.content[0]
     answer_text = getattr(content0, "text", "") or ""
 
-    # Extract citations
+    # Extract URL citations from annotations (if any)
     urls = []
     annotations = getattr(content0, "annotations", []) or []
     for ann in annotations:
@@ -130,28 +135,42 @@ def call_openai_with_web_search(query: str, model: str):
 
 def first_domain_position(urls, domain: str):
     """
-    Returns whether domain is cited + the 1-based index.
+    Given an ordered list of URLs and a tracked domain,
+    return (domain_cited: bool, position: int | None).
+
+    Position is 1-based index of the first URL whose hostname
+    contains the tracked domain.
     """
+    if not domain:
+        return False, None
+
     for i, url in enumerate(urls, start=1):
         try:
             host = urlparse(url).netloc.lower()
-        except:
+        except Exception:
             host = ""
         if domain in host:
             return True, i
+
     return False, None
 
 # -----------------------------
 # Clustering
 # -----------------------------
 def run_clustering(df: pd.DataFrame, embedding_model: str, min_cluster_size: int = 8):
+    """
+    Perform HDBSCAN clustering over query embeddings.
+
+    Returns:
+        df with a 'cluster_label' column (string labels).
+    """
     if hdbscan is None:
-        st.error("hdbscan not installed. Run `pip install hdbscan`.")
+        st.error("hdbscan is not installed. Run `pip install hdbscan`.")
         st.stop()
 
     queries = df["query"].astype(str).tolist()
 
-    st.info("Embedding queries...")
+    st.info("Embedding queries for clustering...")
     emb_resp = client.embeddings.create(
         model=embedding_model,
         input=queries,
@@ -166,17 +185,33 @@ def run_clustering(df: pd.DataFrame, embedding_model: str, min_cluster_size: int
     )
     labels = clusterer.fit_predict(vectors)
 
-    # Convert labels to strings
-    df["cluster_label"] = [
-        "noise" if lbl == -1 else f"cluster_{lbl}" for lbl in labels
-    ]
+    # Convert numeric labels (incl. -1) to strings
+    str_labels = []
+    for label in labels:
+        if label == -1:
+            str_labels.append("noise")
+        else:
+            str_labels.append(f"cluster_{label}")
+
+    df["cluster_label"] = str_labels
     return df
 
 # -----------------------------
 # Topic visibility + URLs
 # -----------------------------
 def build_topic_aggregations(df: pd.DataFrame, tracked_domain: str):
-    # Topic sizes
+    """
+    Build:
+      - topic_summary: per-topic visibility %
+      - topic_urls_tracked: which URLs from tracked domain appear per topic
+
+    Assumes df has columns:
+        - query
+        - cluster_label
+        - domain_cited (bool)
+        - all_citations (string of ';'-joined URLs)
+    """
+    # Topic sizes (how many queries in each topic)
     topic_sizes = (
         df.groupby("cluster_label")["query"]
         .nunique()
@@ -184,7 +219,7 @@ def build_topic_aggregations(df: pd.DataFrame, tracked_domain: str):
         .reset_index()
     )
 
-    # How many queries cite this domain?
+    # How many queries per topic where domain was cited at all
     topic_domain_cited = (
         df[df["domain_cited"]]
         .groupby("cluster_label")["query"]
@@ -205,28 +240,35 @@ def build_topic_aggregations(df: pd.DataFrame, tracked_domain: str):
         * 100.0
     )
 
-    # Explode citations -> tracked only
+    # Explode all_citations into one URL per row, then filter to tracked domain
     df_urls = (
         df.copy()
-        .assign(url_list=lambda d: d["all_citations"].fillna("").split(";"))
+        .assign(
+            url_list=lambda d: d["all_citations"]
+            .fillna("")
+            .astype(str)
+            .str.split(";")
+        )
         .explode("url_list")
     )
 
     df_urls["url"] = df_urls["url_list"].str.strip()
-    df_urls = df_urls[df_urls["url"] != ""]
     df_urls = df_urls.drop(columns=["url_list"])
+    df_urls = df_urls[df_urls["url"] != ""]  # drop blanks
 
-    def is_tracked(url: str):
+    def is_tracked(url: str, domain: str) -> bool:
         try:
             host = urlparse(url).netloc.lower()
-        except:
+        except Exception:
             return False
-        return tracked_domain in host
+        return domain in host
 
-    df_urls_tracked = df_urls[df_urls["url"].apply(is_tracked)]
+    df_urls_tracked = df_urls[
+        df_urls["url"].apply(lambda u: is_tracked(u, tracked_domain))
+    ].copy()
 
     if df_urls_tracked.empty:
-        return topic_summary, pd.DataFrame(
+        topic_urls_tracked = pd.DataFrame(
             columns=[
                 "cluster_label",
                 "url",
@@ -235,13 +277,18 @@ def build_topic_aggregations(df: pd.DataFrame, tracked_domain: str):
                 "query_coverage_pct",
             ]
         )
+        return topic_summary, topic_urls_tracked
 
+    # For each (topic, url) from the tracked domain: in how many distinct queries does it appear?
     topic_urls_tracked = (
         df_urls_tracked.groupby(["cluster_label", "url"])
-        .agg(queries_citing_url=("query", "nunique"))
+        .agg(
+            queries_citing_url=("query", "nunique"),
+        )
         .reset_index()
     )
 
+    # Add topic sizes to compute per-URL % coverage within topic
     topic_urls_tracked = topic_urls_tracked.merge(
         topic_sizes, on="cluster_label", how="left"
     )
@@ -282,7 +329,7 @@ if run_button:
         df = run_clustering(df, embedding_model)
         st.success("Clustering completed.")
     else:
-        st.info("Using existing cluster_label column.")
+        st.info("Using existing 'cluster_label' column (no re-clustering).")
 
     # Prepare columns
     df["domain_cited"] = False
@@ -315,17 +362,20 @@ if run_button:
     # -------------------------
     # Display results
     # -------------------------
-    st.markdown("## Topic-level visibility")
-    st.dataframe(
-        topic_summary.sort_values("visibility_pct", ascending=False),
-        use_container_width=True,
-    )
+    st.markdown("## Topic-level visibility (tracked domain only)")
+    if topic_summary.empty:
+        st.info("No topics found.")
+    else:
+        st.dataframe(
+            topic_summary.sort_values("visibility_pct", ascending=False),
+            use_container_width=True,
+        )
 
-    st.markdown("## URLs from your domain per topic")
+    st.markdown("## Tracked-domain URLs per topic")
     if topic_urls_tracked.empty:
         st.info("No URLs from your domain were cited.")
     else:
-        topics = sorted(topic_urls_tracked["cluster_label"].unique())
+        topics = sorted(topic_urls_tracked["cluster_label"].dropna().unique())
         selected_topic = st.selectbox("Select topic", topics)
 
         topic_view = topic_urls_tracked[
@@ -333,7 +383,14 @@ if run_button:
         ].sort_values("query_coverage_pct", ascending=False)
 
         st.dataframe(
-            topic_view[["url", "queries_citing_url", "topic_query_count", "query_coverage_pct"]],
+            topic_view[
+                [
+                    "url",
+                    "queries_citing_url",
+                    "topic_query_count",
+                    "query_coverage_pct",
+                ]
+            ],
             use_container_width=True,
         )
 
@@ -371,4 +428,5 @@ if run_button:
         "llm_visibility_tracked_urls.csv",
         "text/csv",
     )
+
 
